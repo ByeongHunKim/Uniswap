@@ -1,5 +1,5 @@
 # v2-core
-## code analyze - UniswapV2Factory.sol
+## 1. code analyze - UniswapV2Factory.sol
 - 새로운 pair를 거래하는 컨트랙트를 생성해내고 관리하는 게이트웨이 같은 것
 - 체크한 함수들
     - `createPair()`
@@ -73,10 +73,10 @@
     }
 ```
 
-## UniswapV2Factory.sol 질문
+### 1.1 UniswapV2Factory.sol 질문
 
 
-## code analyze - UniswapV2Pair.sol
+## 2. code analyze - UniswapV2Pair.sol
 - factory contract가 만들어낸 token pair contract
 - 실제로 두 토큰을 거래하는 풀이자 거래소가 된다
 
@@ -109,6 +109,17 @@
 
     function _update(uint balance0, uint balance1, uint112 _reserve0, uint112 _reserve1) private {
         require(balance0 <= uint112(-1) && balance1 <= uint112(-1), 'UniswapV2: OVERFLOW');
+
+        /*
+            Uniswap을 price oracle로 쓰기 위한 로직
+            각각의 price들이 유지된 시간의 가중치 만큼 더해서 평균을 내어 현재 가격을 결정
+            
+            uint public price0CumulativeLast;
+            uint public price1CumulativeLast;
+            이렇게 public으로 선언되어 있는 변수 값을 변경하기 떄문에, 다른 컨트랙트에서 이 Uniswap을 price oracle로 쓰려면
+            위의 변수를 보면 된다. 그러면 시간에 따라서 달라지는 가격을 완충해서 볼 수 있기 때문에 다른 컨트랙트에서
+            가격 정보를 받아올 수 있다
+        */
         uint32 blockTimestamp = uint32(block.timestamp % 2**32);
         uint32 timeElapsed = blockTimestamp - blockTimestampLast; // overflow is desired
         if (timeElapsed > 0 && _reserve0 != 0 && _reserve1 != 0) {
@@ -116,11 +127,98 @@
         price0CumulativeLast += uint(UQ112x112.encode(_reserve1).uqdiv(_reserve0)) * timeElapsed;
         price1CumulativeLast += uint(UQ112x112.encode(_reserve0).uqdiv(_reserve1)) * timeElapsed;
         }
+        
+        // reserve가 곧 받아온 값을 업데이트 해주는 건가?
         reserve0 = uint112(balance0);
         reserve1 = uint112(balance1);
         blockTimestampLast = blockTimestamp;
         emit Sync(reserve0, reserve1);
     }
+
+    /*
+      프로토콜 fee를 계산하는 공식을 담당하는 함수 
+      백서를 좀 봐야한다..
+    */
+    function _mintFee(uint112 _reserve0, uint112 _reserve1) private returns (bool feeOn) {
+        address feeTo = IUniswapV2Factory(factory).feeTo();
+        feeOn = feeTo != address(0);
+        uint _kLast = kLast; // gas savings
+        if (feeOn) {
+            if (_kLast != 0) {
+                uint rootK = Math.sqrt(uint(_reserve0).mul(_reserve1));
+                uint rootKLast = Math.sqrt(_kLast);
+                if (rootK > rootKLast) {
+                    uint numerator = totalSupply.mul(rootK.sub(rootKLast));
+                    uint denominator = rootK.mul(5).add(rootKLast);
+                    uint liquidity = numerator / denominator;
+                    if (liquidity > 0) _mint(feeTo, liquidity);
+                }
+            }
+        } else if (_kLast != 0) {
+            kLast = 0;
+        }
+    }
+    
+    /*
+        LP 토큰을 만들어내는 함수
+        이 pair 컨트랙트가 기록하고 있는 자신의 자산의 양과 실제로 해당 token0 또는 1 컨트랙트에 기록되는
+        자기 자산의 양이 다를 수 있다고 했다.
+        case 1 : 만약에 token0,1 컨트랙트에 있는 내 자산의 양이 더 많다고 하면 mint 시켜준다
+        case 2 : 반대로 더 적다면 burn 시켜준다
+        그것을 보고 mint / burn 할 지 정하는 것이다
+    */
+    function mint(address to) external lock returns (uint liquidity) {
+        (uint112 _reserve0, uint112 _reserve1,) = getReserves(); // gas savings
+        
+        // mint를 하기 위해서는 token0의 컨트랙트로 가서 balanceOf를 호출해서 내 잔고를 받아온다 ( 나머지 pair 토큰도 동일하게 잔고 체크 )
+        uint balance0 = IERC20(token0).balanceOf(address(this));
+        uint balance1 = IERC20(token1).balanceOf(address(this));
+
+        /* 
+        _reverve0(1)은 이 pair 컨트랙트에 기록하고 있는 잔고를 의미한다
+        받아온 잔고에서 내가 기록한 잔고를 뺴면 내가 받은 amount가 계산된다
+        */ 
+        uint amount0 = balance0.sub(_reserve0);
+        uint amount1 = balance1.sub(_reserve1);
+        
+        // 위 둘을 가지로 수수료 계산 ( 인플레이션이 되었기 때문 )
+        bool feeOn = _mintFee(_reserve0, _reserve1);
+
+        uint _totalSupply = totalSupply; // gas savings, must be defined here since totalSupply can update in _mintFee
+        /*
+        이 컨트랙트에 처음으로 pair를 넣는 사람이라면, LP share의 최소 단위 ( 1 LP token의 천배에 해당하는 돈이 burn )
+        amount0 * amount1의 루트값(기하평균값..?) - minimum liquidity
+        그리고 그 minimum  liquidity는 address0에게 생성된다
+        그런데 address(0)의 소유주는 존재하지 않기 떄문에 보내지는 돈은 묶이게 된다
+        결국 이 사람은 amount0 * amount1의 루트값(기하평균값..?) - minimum liquidity 이만큼 뺸 양의 liquidity를 가지고 가게 된다
+        */ 
+        if (_totalSupply == 0) {
+            liquidity = Math.sqrt(amount0.mul(amount1)).sub(MINIMUM_LIQUIDITY);
+            _mint(address(0), MINIMUM_LIQUIDITY); // permanently lock the first MINIMUM_LIQUIDITY tokens
+        } else {
+            /*
+             새로 생성한 사람이 아니라면 그냥 인플레이션을 시킨다
+             totalSupply * amount0 / reserve0 만큼을 생성히는데, 
+             그 전에 token0,1 중에 더 적은 걸로 골라서 LP Token을 만들어 낸다
+            */
+            liquidity = Math.min(amount0.mul(_totalSupply) / _reserve0, amount1.mul(_totalSupply) / _reserve1);
+        }
+        require(liquidity > 0, 'UniswapV2: INSUFFICIENT_LIQUIDITY_MINTED');
+        
+        // 모든 과정이 끝나면 지금 돈을 넣은 사람의 주소로 LP Token을 보내준다
+        _mint(to, liquidity);
+        
+        // balance 업데이트 ( pair 컨트랙트에 잔고 기록 )
+        _update(balance0, balance1, _reserve0, _reserve1);
+
+        // kLast 업데이트 된 K 값 = 두 토큰 수량의 곱에 해당하는 K 값도 업데이트 해준다
+        if (feeOn) kLast = uint(reserve0).mul(reserve1); // reserve0 and reserve1 are up-to-date
+
+        // mint했다고 로그 남김
+        emit Mint(msg.sender, amount0, amount1);
+    }
 ```
 
-## UniswapV2Factory.sol 질문
+### 2.1 UniswapV2Factory.sol 질문
+- 왜 더 적은 걸로 골라서 LP TOKEN을 만들어 내는지 모르겠음
+  - `liquidity = Math.min(amount0.mul(_totalSupply) / _reserve0, amount1.mul(_totalSupply) / _reserve1);`
