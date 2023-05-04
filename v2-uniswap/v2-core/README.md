@@ -88,11 +88,38 @@
       factory = msg.sender;
     }
     
-    // 
+    /*
+        factory에서 call(호출)을 하면 token0에는 token0 argument, token1에는 token1 argument를 대입해준다
+  
+    */
+    
     function initialize(address _token0, address _token1) external {
       require(msg.sender == factory, 'UniswapV2: FORBIDDEN'); // sufficient check
       token0 = _token0;
       token1 = _token1;
+    }
+    
+    /*
+        계속해서 본인이 얼마나 들고 있는 지 추적함 
+        하지만 추적이 항상 맞지 않은 이유는 실제 잔고(balance)는 token0,1 컨트랙트에 있기 때문에 잔고에 대한 정보는
+        컨트랙트에 가야지 볼 수 있다. 여기서 기록하고 있는 토큰의 수량보다 토큰 컨트랙트에 가서 관찰했을 때 거기의 잔고가 더
+        많다면, 돈을 받았다는 것을 알 수 있다. 즉 이 토큰 풀에 토큰이 입금 되었다는 것을 알 수 있다
+        이런 정보를 보고 업데이트를 해주는 역할을 하는게 _update()이다
+    */
+
+    function _update(uint balance0, uint balance1, uint112 _reserve0, uint112 _reserve1) private {
+        require(balance0 <= uint112(-1) && balance1 <= uint112(-1), 'UniswapV2: OVERFLOW');
+        uint32 blockTimestamp = uint32(block.timestamp % 2**32);
+        uint32 timeElapsed = blockTimestamp - blockTimestampLast; // overflow is desired
+        if (timeElapsed > 0 && _reserve0 != 0 && _reserve1 != 0) {
+        // * never overflows, and + overflow is desired
+        price0CumulativeLast += uint(UQ112x112.encode(_reserve1).uqdiv(_reserve0)) * timeElapsed;
+        price1CumulativeLast += uint(UQ112x112.encode(_reserve0).uqdiv(_reserve1)) * timeElapsed;
+        }
+        reserve0 = uint112(balance0);
+        reserve1 = uint112(balance1);
+        blockTimestampLast = blockTimestamp;
+        emit Sync(reserve0, reserve1);
     }
 ```
 
